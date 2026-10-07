@@ -1,4 +1,4 @@
-﻿"""
+"""
 Seed tujifunze_data.db with realistic synthetic student data
 across 3 academic terms for multiple students.
 
@@ -289,6 +289,34 @@ def init_db():
         CREATE INDEX idx_scores_student_term  ON scores(student_id, term);
         CREATE INDEX idx_attendance_student   ON attendance(student_id);
         CREATE INDEX idx_observations_student ON observations(student_id);
+
+        CREATE TABLE flagged_patterns (
+            pattern_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id        TEXT NOT NULL,
+            pattern_type      TEXT NOT NULL,
+            description       TEXT NOT NULL,
+            source_citations  TEXT NOT NULL,
+            created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (student_id) REFERENCES students(student_id)
+        );
+
+        CREATE INDEX idx_patterns_student ON flagged_patterns(student_id);
+
+        CREATE TABLE draft_reports (
+            report_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id         TEXT NOT NULL,
+            summary_text       TEXT NOT NULL,
+            citations          TEXT NOT NULL,
+            status             TEXT NOT NULL DEFAULT 'draft',
+            created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+            approved_at        TEXT,
+            approved_by        TEXT,
+            final_text         TEXT,
+            FOREIGN KEY (student_id) REFERENCES students(student_id)
+        );
+
+        CREATE INDEX idx_reports_student ON draft_reports(student_id);
+        CREATE INDEX idx_reports_status  ON draft_reports(status);
     """)
 
     cur.executemany(
