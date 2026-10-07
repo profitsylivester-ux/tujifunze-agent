@@ -621,22 +621,25 @@ def _render_patterns(patterns: list) -> None:
 
 
 def _run_agent(student_id: str) -> None:
+    """Run the graph for one student, updating pills live.
+
+    When the graph interrupts at the HITL gate, render the review section
+    inline using the payload directly — no session_state, no rerun race.
+    """
     thread_id = f"ui-{student_id}-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
     config = {"configurable": {"thread_id": thread_id}}
 
+    st.session_state["thread_config"] = config
     st.session_state["interrupt_payload"] = None
     st.session_state["final_state"] = None
-    st.session_state["completed_nodes"] = []
-    st.session_state["thread_config"] = config
-    st.session_state["edited_text"] = None
 
-    # A single placeholder that updates live as nodes complete.
     pills_placeholder = st.empty()
-    completed = []
+    completed: list[str] = []
 
-    # Show the very first node as "active" before we start
     with pills_placeholder.container():
         _render_node_pills(completed, active="retrieve")
+
+    hitl_payload = None
 
     for chunk in agent_graph.stream(
         {"student_id": student_id, "errors": []},
@@ -644,22 +647,154 @@ def _run_agent(student_id: str) -> None:
         stream_mode="updates",
     ):
         if "__interrupt__" in chunk:
-            interrupts = chunk["__interrupt__"]
-            st.session_state["interrupt_payload"] = interrupts[0].value
+            hitl_payload = chunk["__interrupt__"][0].value
             completed.append("hitl")
-            st.session_state["completed_nodes"] = completed
             with pills_placeholder.container():
                 _render_node_pills(completed, paused=True)
             break
 
         for node_name, _ in chunk.items():
             completed.append(node_name)
-            st.session_state["completed_nodes"] = completed
-            # Mark the next node as active (if there is one)
             idx = NODE_ORDER.index(node_name) if node_name in NODE_ORDER else -1
             next_active = NODE_ORDER[idx + 1] if 0 <= idx < len(NODE_ORDER) - 1 else ""
             with pills_placeholder.container():
                 _render_node_pills(completed, active=next_active)
+
+    # ---- Render the HITL section inline (payload is in scope) ----
+    if hitl_payload:
+        st.session_state["interrupt_payload"] = hitl_payload
+        _render_hitl_inline(hitl_payload, student_id)
+
+
+def _render_hitl_inline(payload: dict, student_id: str) -> None:
+    """Render the teacher review gate with the agent draft and remarks box."""
+    student = _get_student(student_id)
+    if not student:
+        st.error(f"Student {student_id} not found.")
+        return
+
+    # -------- Draft summary (editable) --------
+    st.markdown("<div class='tj-section-title'>Agent draft (editable)</div>", unsafe_allow_html=True)
+    st.caption(
+        "This is the agent's plain-language summary. Edit any part of it, "
+        "or write your own version below."
+    )
+    draft = st.text_area(
+        "Agent draft",
+        value=payload.get("draft_summary", ""),
+        height=180,
+        label_visibility="collapsed",
+        key=f"draft_{student_id}",
+    )
+
+    # -------- Teacher remarks (free-form) --------
+    st.markdown("<div class='tj-section-title'>Your remarks (optional)</div>", unsafe_allow_html=True)
+    st.caption(
+        "Add your own observations, notes for the guardian, or anything else "
+        "you want on the final report. This appears below the summary on the PDF."
+    )
+    remarks = st.text_area(
+        "Teacher remarks",
+        value="",
+        height=120,
+        placeholder=(
+            "e.g. Amina has had a strong year. I recommend continuing to challenge "
+            "her with extension problems in Mathematics next term."
+        ),
+        label_visibility="collapsed",
+        key=f"remarks_{student_id}",
+    )
+
+    # -------- Citations --------
+    st.markdown("<div class='tj-section-title'>Citations supporting this report</div>", unsafe_allow_html=True)
+    cites = payload.get("draft_citations", [])
+    chips = "".join(f"<span class='tj-chip'>{_resolve_preview(c)}</span>" for c in cites)
+    st.markdown(chips or "<em>No citations attached.</em>", unsafe_allow_html=True)
+
+    # -------- Report metadata for the PDF header --------
+    st.markdown("<div class='tj-section-title'>Report details (PDF header)</div>", unsafe_allow_html=True)
+    st.caption("These appear on the PDF cover page.")
+
+    latest_term = _latest_term_for_student(student_id)
+    c1, c2 = st.columns(2)
+    with c1:
+        school = st.text_input(
+            "School name",
+            value=st.session_state.get("_default_school", "Tujifunze Academy"),
+            key=f"school_{student_id}",
+        )
+        class_section = st.text_input(
+            "Class / Section",
+            value=st.session_state.get("_default_class", f"Grade {student.get('grade_level', '')}"),
+            key=f"class_{student_id}",
+        )
+        academic_year = st.text_input(
+            "Academic year",
+            value=st.session_state.get("_default_year", str(student.get("cohort_year", ""))),
+            key=f"year_{student_id}",
+        )
+        term = st.text_input(
+            "Term",
+            value=st.session_state.get("_default_term", latest_term),
+            key=f"term_{student_id}",
+        )
+    with c2:
+        teacher_name = st.text_input(
+            "Teacher name",
+            value=st.session_state.get("username", ""),
+            key=f"teacher_{student_id}",
+        )
+        guardian_name = st.text_input(
+            "Guardian name (optional)",
+            value="",
+            key=f"guardian_{student_id}",
+        )
+
+    # -------- Actions --------
+    col_a, col_b, _ = st.columns([1, 1, 3])
+    with col_a:
+        if st.button("Approve & Finalize", type="primary", use_container_width=True, key=f"approve_{student_id}"):
+            st.session_state["pdf_meta"] = {
+                "school_name": school,
+                "class_section": class_section,
+                "academic_year": academic_year,
+                "term": term,
+                "teacher_name": teacher_name,
+                "guardian_name": guardian_name,
+                "teacher_remarks": remarks,
+                "report_id": payload.get("draft_report_id", "-"),
+            }
+            _approve_and_finalize(draft)
+    with col_b:
+        if st.button("Reject", type="secondary", use_container_width=True, key=f"reject_{student_id}"):
+            _reject_draft()
+
+    # -------- Verified patterns --------
+    patterns = payload.get("verified_patterns", [])
+    if patterns:
+        st.markdown("<div class='tj-section-title'>Verified patterns</div>", unsafe_allow_html=True)
+        _render_patterns(patterns)
+
+    warnings = payload.get("verification_warnings", [])
+    if warnings:
+        with st.expander(f"Verification warnings ({len(warnings)})"):
+            for w in warnings:
+                st.warning(w)
+
+
+def _get_student(student_id: str) -> dict | None:
+    """Fetch a single student row as a dict."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT student_id, full_name, grade_level, cohort_year "
+            "FROM students WHERE student_id = ?",
+            (student_id,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
 
 
 def _approve_and_finalize(edited_text: str) -> None:
@@ -711,124 +846,7 @@ if run_clicked:
     _run_agent(selected["student_id"])
 
 
-payload = st.session_state.get("interrupt_payload")
-if payload:
-    st.markdown("<div class='tj-section-title'>Draft report (editable)</div>", unsafe_allow_html=True)
-    st.caption(
-        "Review the draft. Edit if needed, fill the report details, "
-        "then approve to generate the PDF."
-    )
-
-    default_text = st.session_state.get("edited_text") or payload.get("draft_summary", "")
-    edited = st.text_area(
-        "Report text",
-        value=default_text,
-        height=200,
-        label_visibility="collapsed",
-    )
-
-    st.markdown("<div class='tj-section-title'>Citations supporting this report</div>", unsafe_allow_html=True)
-    cites = payload.get("draft_citations", [])
-    chips = "".join(f"<span class='tj-chip'>{_resolve_preview(c)}</span>" for c in cites)
-    st.markdown(chips, unsafe_allow_html=True)
-
-    # ---- Report details form (for the PDF header) ----
-    st.markdown("<div class='tj-section-title'>Report details</div>", unsafe_allow_html=True)
-    st.caption("These appear on the PDF cover page. Adjust as needed before approving.")
-
-    # Auto-defaults
-    latest_term = _latest_term_for_student(selected["student_id"])
-    # Reset form defaults whenever the selected student changes
-    if st.session_state.get("_details_for_student") != selected["student_id"]:
-        st.session_state["_details_for_student"] = selected["student_id"]
-        st.session_state["_default_school"] = "Tujifunze Academy"
-        st.session_state["_default_class"] = f"Grade {selected['grade_level']}"
-        st.session_state["_default_year"] = str(selected["cohort_year"])
-        st.session_state["_default_term"] = latest_term
-        st.session_state["_default_teacher"] = st.session_state.get("username", "")
-        st.session_state["_default_guardian"] = ""
-        st.session_state["_default_remarks"] = ""
-
-    with st.form("report_details_form", clear_on_submit=False):
-        c1, c2 = st.columns(2)
-        with c1:
-            school_name = st.text_input(
-                "School name",
-                value=st.session_state["_default_school"],
-                placeholder="e.g. Tujifunze Academy",
-                help="The full name of the school - appears at the top of the PDF.",
-            )
-            class_section = st.text_input(
-                "Class / Section",
-                value=st.session_state["_default_class"],
-                placeholder="e.g. Grade 7A",
-                help="The class or section the student belongs to.",
-            )
-            academic_year = st.text_input(
-                "Academic year",
-                value=st.session_state["_default_year"],
-                placeholder="e.g. 2024",
-                help="The academic year this report covers.",
-            )
-            term = st.text_input(
-                "Term",
-                value=st.session_state["_default_term"],
-                placeholder="e.g. Term 3 2024",
-                help="Which term this report covers.",
-            )
-        with c2:
-            teacher_name = st.text_input(
-                "Teacher name",
-                value=st.session_state["_default_teacher"],
-                placeholder="e.g. Mr. Faida Sylivester",
-                help="Your full name as it should appear on the report.",
-            )
-            guardian_name = st.text_input(
-                "Guardian name (optional)",
-                value=st.session_state["_default_guardian"],
-                placeholder="e.g. Mrs. Amina Hassan",
-                help="Leave blank if this is a teacher-only report.",
-            )
-            teacher_remarks = st.text_area(
-                "Teacher remarks (optional)",
-                value=st.session_state["_default_remarks"],
-                placeholder="e.g. Amina has had a strong year. I recommend continuing to challenge her with extension problems in Mathematics next term.",
-                height=100,
-                help="Free-form notes you want to include below the summary.",
-            )
-
-        st.form_submit_button("Save details", use_container_width=False)
-        # The values are read on Approve click below
-
-    col_a, col_b, _ = st.columns([1, 1, 3])
-    with col_a:
-        if st.button("Approve & Finalize", type="primary", use_container_width=True):
-            # Bundle the form values into session_state so the approved-report
-            # section can build the PDF from them.
-            st.session_state["pdf_meta"] = {
-                "school_name": school_name,
-                "class_section": class_section,
-                "academic_year": academic_year,
-                "term": term,
-                "teacher_name": teacher_name,
-                "guardian_name": guardian_name,
-                "teacher_remarks": teacher_remarks,
-                "report_id": payload.get("draft_report_id", "-"),
-            }
-            _approve_and_finalize(edited)
-    with col_b:
-        if st.button("Reject", type="secondary", use_container_width=True):
-            _reject_draft()
-
-    patterns = payload.get("verified_patterns", [])
-    if patterns:
-        st.markdown("<div class='tj-section-title'>Verified patterns</div>", unsafe_allow_html=True)
-        _render_patterns(patterns)
-
-    if payload.get("verification_warnings"):
-        with st.expander("Warnings from verification"):
-            for w in payload["verification_warnings"]:
-                st.warning(w)
+# NOTE: HITL section is rendered inline inside _run_agent above.
 
 
 final = st.session_state.get("final_state")
