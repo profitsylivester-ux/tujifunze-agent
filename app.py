@@ -16,6 +16,29 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
+# ---------------------------------------------------------------------------
+# Auto-seed the SQLite database on first run.
+# The DB file is git-ignored, so it must be regenerated in any fresh
+# environment (local machine, Streamlit Cloud cold start, etc.).
+# ---------------------------------------------------------------------------
+def _ensure_database() -> None:
+    from pathlib import Path as _P
+    import subprocess
+    import sys as _sys
+
+    project_root = _P(__file__).resolve().parent
+    db_path = project_root / "data" / "tujifunze_data.db"
+
+    if not db_path.exists():
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [_sys.executable, str(project_root / "scripts" / "init_db.py")],
+            cwd=str(project_root),
+            check=True,
+        )
+
+_ensure_database()
+
 import hmac
 import sys
 from datetime import datetime
